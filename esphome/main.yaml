@@ -1,0 +1,290 @@
+# ==============================================================================
+#   ESP32 Cube Remote — универсальный пульт умного дома в виде куба
+#   https://github.com/kuksenkoandrey/esp32-cube-remote
+# ==============================================================================
+# Плата: ESP32-C6
+# MPU6050 (I2C 0x68) — определение граней и ударов
+# SSD1306 128x64 (I2C 0x3C) — OLED-дисплей
+# ==============================================================================
+
+substitutions:
+  name: cube-remote
+  friendly_name: "Cube Remote"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -10
+    then:
+      - text_sensor.template.publish:
+          id: cube_gesture
+          state: "Нет_жеста"
+      - lambda: 'id(boot_time_ms) = millis();'
+      - output.turn_off: xiao_led_out
+      - script.execute: cube_sleep_timer
+
+esp32:
+  variant: esp32c6
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+time:
+  - platform: homeassistant
+    id: current_time
+    timezone: "Europe/Moscow"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  ap:
+    ssid: "Cube Remote Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# ---------- Шрифты для OLED ----------
+font:
+  - file: "gfonts://Roboto"
+    id: font_time
+    size: 20
+    glyphs: [ '0123456789/:- ' ]
+  - file: "gfonts://Roboto"
+    id: font_data
+    size: 11
+    glyphs: [ '0123456789!"#$%&''()*+,-./:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ', "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя°" ]
+  - file: "gfonts://Roboto"
+    id: font_digits
+    size: 28
+    glyphs: [ '0123456789' ]
+  - file: "gfonts://Roboto"
+    id: font_cube
+    size: 35
+    glyphs: [ 'CUBE' ]
+
+# ---------- Deep sleep ----------
+deep_sleep:
+  id: deep_sleep_component
+
+# ---------- Светодиод (XIAO) ----------
+output:
+  - platform: gpio
+    pin: GPIO15
+    id: xiao_led_out
+    inverted: true
+
+# ---------- Глобальные переменные ----------
+globals:
+  - id: tap_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: is_waiting_for_taps
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: last_tap_time
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: boot_time_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# ---------- I2C ----------
+i2c:
+  sda: GPIO22
+  scl: GPIO23
+  scan: true
+  id: bus_a
+
+# ---------- Датчики ----------
+sensor:
+  # Данные из Home Assistant (примеры — замени на свои entity_id)
+  - platform: homeassistant
+    id: co2_val
+    entity_id: sensor.example_co2
+  - platform: homeassistant
+    id: temp_val
+    entity_id: sensor.example_temperature
+  - platform: homeassistant
+    id: hum_val
+    entity_id: sensor.example_humidity
+
+  # MPU6050 — акселерометр + гироскоп
+  - platform: mpu6050
+    address: 0x68
+    i2c_id: bus_a
+    update_interval: 20ms
+    accel_x:
+      id: accel_x_val
+    accel_y:
+      id: accel_y_val
+    accel_z:
+      id: accel_z_val
+      on_value:
+        then:
+          - lambda: |-
+              float ax = id(accel_x_val).state;
+              float ay = id(accel_y_val).state;
+              float az = id(accel_z_val).state;
+              float total_accel = sqrt(ax*ax + ay*ay + az*az);
+              if (total_accel > 17.5f) {
+                uint32_t current_time = millis();
+                if (current_time - id(last_tap_time) > 120) {
+                  id(last_tap_time) = current_time;
+                  id(cube_sleep_timer).execute();
+                  if (!id(is_waiting_for_taps)) {
+                    id(is_waiting_for_taps) = true;
+                    id(tap_count) = 1;
+                    id(cube_gesture_processor).execute();
+                  } else {
+                    id(tap_count)++;
+                  }
+                }
+              }
+    gyro_x:
+      name: "Cube Gyro X"
+    gyro_y:
+      name: "Cube Gyro Y"
+    gyro_z:
+      name: "Cube Gyro Z"
+    temperature:
+      name: "Cube MPU Temperature"
+
+# ---------- Бинарные сенсоры ----------
+binary_sensor:
+  - platform: homeassistant
+    id: lock_status
+    entity_id: switch.example_lock
+
+# ---------- Скрипты ----------
+script:
+  - id: cube_sleep_timer
+    mode: restart
+    then:
+      - delay: 30s
+      - logger.log: "30 секунд прошло. Куб засыпает..."
+      - deep_sleep.enter: deep_sleep_component
+
+  - id: cube_gesture_processor
+    mode: restart
+    then:
+      - delay: 750ms
+      - lambda: |-
+          id(is_waiting_for_taps) = false;
+          int final_taps = id(tap_count);
+          id(tap_count) = 0;
+          if (final_taps == 2) {
+            id(cube_gesture).publish_state("2_удара");
+          } else if (final_taps == 3) {
+            id(cube_gesture).publish_state("3_удара");
+          } else if (final_taps == 5) {
+            id(cube_gesture).publish_state("5_ударов");
+          }
+      - delay: 1500ms
+      - text_sensor.template.publish:
+          id: cube_gesture
+          state: "Нет_жеста"
+
+# ---------- Текстовые сенсоры ----------
+text_sensor:
+  - platform: homeassistant
+    id: ha_time_string
+    entity_id: sensor.time
+
+  - platform: template
+    name: "Куб Положение"
+    id: cube_position
+    icon: "mdi:cube-outline"
+    update_interval: 200ms
+    lambda: |-
+      float x = id(accel_x_val).state;
+      float y = id(accel_y_val).state;
+      float z = id(accel_z_val).state;
+      float threshold = 7.0f;
+      static std::string last_sent_side = "";
+      std::string current_side = id(cube_position).state;
+      if (z > threshold) {
+        current_side = "Сцена_1";
+        if (current_side != last_sent_side) id(oled_display).set_rotation(DISPLAY_ROTATION_0_DEGREES);
+      }
+      else if (z < -threshold) {
+        current_side = "Сцена_2";
+        if (current_side != last_sent_side) id(oled_display).set_rotation(DISPLAY_ROTATION_180_DEGREES);
+      }
+      else if (x > threshold) {
+        current_side = "Сцена_3";
+        if (current_side != last_sent_side) id(oled_display).set_rotation(DISPLAY_ROTATION_0_DEGREES);
+      }
+      else if (x < -threshold) {
+        current_side = "Сцена_4";
+        if (current_side != last_sent_side) id(oled_display).set_rotation(DISPLAY_ROTATION_0_DEGREES);
+      }
+      else if (y > threshold) {
+        current_side = "Сцена_5";
+        if (current_side != last_sent_side) id(oled_display).set_rotation(DISPLAY_ROTATION_90_DEGREES);
+      }
+      else if (y < -threshold) {
+        current_side = "Сцена_6";
+        if (current_side != last_sent_side) id(oled_display).set_rotation(DISPLAY_ROTATION_270_DEGREES);
+      }
+      if (current_side != last_sent_side && current_side != "") {
+        last_sent_side = current_side;
+        id(cube_sleep_timer).execute();
+      }
+      return current_side;
+
+  - platform: template
+    name: "Куб Жесты"
+    id: cube_gesture
+    icon: "mdi:gesture-tap"
+
+# ---------- Дисплей SSD1306 ----------
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: oled_display
+    lambda: |-
+      it.fill(COLOR_OFF);
+      bool holds_splash = (millis() - id(boot_time_ms) < 3000);
+      bool no_time_yet = (!id(ha_time_string).has_state() || id(ha_time_string).state == "" || id(ha_time_string).state == "unknown");
+      if (holds_splash || no_time_yet) {
+        it.print(64, 14, id(font_cube), COLOR_ON, TextAlign::TOP_CENTER, "CUBE");
+      } else {
+        std::string raw_time = id(ha_time_string).state;
+        std::string current_side = id(cube_position).state;
+        if (current_side == "Сцена_5" || current_side == "Сцена_6") {
+          if (raw_time.length() >= 5) {
+            std::string hours = raw_time.substr(0, 2);
+            std::string minutes = raw_time.substr(3, 2);
+            it.print(32, 30, id(font_digits), COLOR_ON, TextAlign::TOP_CENTER, hours.c_str());
+            it.print(32, 66, id(font_digits), COLOR_ON, TextAlign::TOP_CENTER, minutes.c_str());
+          }
+        } else {
+          it.printf(64, 0, id(font_time), COLOR_ON, TextAlign::TOP_CENTER, "%s", raw_time.c_str());
+          it.line(0, 22, 127, 22, COLOR_ON);
+          it.printf(0, 25, id(font_data), COLOR_ON, TextAlign::TOP_LEFT, "Т: %.1f°C  В: %.0f%%", id(temp_val).state, id(hum_val).state);
+          it.printf(0, 39, id(font_data), COLOR_ON, TextAlign::TOP_LEFT, "CO2: %.0f ppm", id(co2_val).state);
+          if (id(lock_status).state) {
+            it.print(0, 53, id(font_data), COLOR_ON, TextAlign::TOP_LEFT, "Замок: ЗАКРЫТ");
+          } else {
+            it.print(0, 53, id(font_data), COLOR_ON, TextAlign::TOP_LEFT, "Замок: ОТКРЫТ");
+          }
+        }
+      }
